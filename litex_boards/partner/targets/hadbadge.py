@@ -13,10 +13,14 @@ from migen.genlib.resetsync import AsyncResetSynchronizer
 from litex_boards.platforms import hadbadge
 
 from litex.soc.cores.clock import *
-from litex.soc.integration.soc_core import *
+from litex.soc.integration.soc_sdram import *
+#from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
 
-from .spi_ram_dual import SpiRamDualQuad
+#from .spi_ram_dual import SpiRamDualQuad
+
+from litedram import modules as litedram_modules
+from litedram.phy import GENSDRPHY
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -26,11 +30,12 @@ class _CRG(Module):
     Input: 8 MHz
     Output: 48 MHz
     """
-    def __init__(self, platform):
+    def __init__(self, platform, sys_clk_freq):
         self.clock_domains.cd_por = ClockDomain(reset_less=True)
         self.clock_domains.cd_sys = ClockDomain()
         self.clock_domains.cd_clk12 = ClockDomain()
         self.clock_domains.cd_clk48 = ClockDomain()
+        self.clock_domains.cd_sys_ps = ClockDomain(reset_less=True)
 
         # # #
 
@@ -38,6 +43,7 @@ class _CRG(Module):
         self.cd_por.clk.attr.add("keep")
         self.cd_clk12.clk.attr.add("keep")
         self.cd_clk48.clk.attr.add("keep")
+        self.cd_sys_ps.clk.attr.add("keep")
 
         self.stop = Signal()
 
@@ -59,11 +65,15 @@ class _CRG(Module):
         # pll
         self.submodules.pll = pll = ECP5PLL()
         pll.register_clkin(clk8, 8e6)
-        pll.create_clkout(self.cd_sys, 48e6, phase=0, margin=1e-9)
+        pll.create_clkout(self.cd_sys, sys_clk_freq, phase=0, margin=1e-9)
         pll.create_clkout(self.cd_clk12, 12e6, phase=39, margin=1e-9)
+        pll.create_clkout(self.cd_sys_ps, sys_clk_freq, phase=20)
         self.comb += self.cd_clk48.clk.eq(self.cd_sys.clk)
         # pll.create_clkout(self.cd_sys, 48e6, phase=0, margin=1e-9)
         # pll.create_clkout(self.cd_clk12, 12e6, phase=132, margin=1e-9)
+
+        # sdram clock
+        self.comb += platform.request("sdram_clock").eq(self.cd_sys_ps.clk)
 
         # Synchronize USB48 and USB12, and drive USB12 from USB48
         self.specials += [
@@ -84,7 +94,7 @@ class _CRG(Module):
 
 # BaseSoC ------------------------------------------------------------------------------------------
 
-class BaseSoC(SoCCore):
+class BaseSoC(SoCSDRAM):
 #    SoCCore.csr_map = {
 #        "ctrl":           0,  # provided by default (optional)
 #        "crg":            1,  # user
@@ -106,7 +116,7 @@ class BaseSoC(SoCCore):
     # defaults.  This is because the mmu only allows for certain
     # regions to be unbuffered:
     # https://github.com/m-labs/VexRiscv-verilog/blob/master/src/main/scala/vexriscv/GenCoreDefault.scala#L139-L143
-    SoCCore.mem_map = {
+    SoCSDRAM.mem_map = {
         "rom":          0x00000000,
         "sram":         0x10000000,
         "emulator_ram": 0x20000000,
@@ -116,16 +126,16 @@ class BaseSoC(SoCCore):
         "csr":          0xe0000000,
     }
 
-    def __init__(self, debug=True, **kwargs):
+    def __init__(self, debug=True, sdram_module_cls="AS4C32M8", **kwargs):
         platform = hadbadge.Platform()
         clk_freq = int(48e6)
-        SoCCore.__init__(self, platform, clk_freq,
+        SoCSDRAM.__init__(self, platform, clk_freq,
                          integrated_rom_size=16384,
                          integrated_sram_size=65536,
                          wishbone_timeout_cycles=1e9,
                          **kwargs)
 
-        self.submodules.crg = _CRG(self.platform)
+        self.submodules.crg = _CRG(self.platform, sys_clk_freq=clk_freq)
 
         # Add a "Version" module so we can see what version of the board this is.
 #        self.submodules.version = Version("proto2", [
@@ -138,13 +148,13 @@ class BaseSoC(SoCCore):
 #        self.submodules.usb = ClockDomainsRenamer({
 #            "usb_48": "clk48",
 #            "usb_12": "clk12",
-#        })(DummyUsb(usb_iobuf, debug=debug, product="Hackaday Supercon Badge"))
-
+#        })(DummyUsb(usb_iobuf, debug=debug, product="Hackaday Supercon Badge", cdc=True))
+#
 #        if debug:
 #            self.add_wb_master(self.usb.debug_bridge.wishbone)
 #
 #            if self.cpu_type is not None:
-#                self.register_mem("vexriscv_debug", 0xf00f0000, self.cpu.debug_bus, 0x200)
+#                self.register_mem("vexriscv_debug", 0xb00f0000, self.cpu.debug_bus, 0x200)
 #                self.cpu.use_external_variant("rtl/VexRiscv_HaD_Debug.v")
 #        elif self.cpu_type is not None:
 #            self.cpu.use_external_variant("rtl/VexRiscv_HaD.v")
@@ -159,10 +169,15 @@ class BaseSoC(SoCCore):
 #            self.register_mem("spiflash", self.mem_map["spiflash"], self.picorvspi.bus, size=self.picorvspi.size)
 
         # # Add the 16 MB SPI RAM at address 0x40000000 # Value at 40010000: afbfcfef
-        reset_cycles = 2**14-1
-        ram = SpiRamDualQuad(platform.request("spiram4x", 0), platform.request("spiram4x", 1), dummy=5, reset_cycles=reset_cycles, qpi=True)
-        self.submodules.ram = ram
-        self.register_mem("main_ram", self.mem_map["main_ram"], self.ram.bus, size=16 * 1024 * 1024)
+#        reset_cycles = 2**14-1
+#        ram = SpiRamDualQuad(platform.request("spiram4x", 0), platform.request("spiram4x", 1), dummy=5, reset_cycles=reset_cycles, qpi=True)
+#        self.submodules.ram = ram
+#        self.register_mem("main_ram", self.mem_map["main_ram"], self.ram.bus, size=16 * 1024 * 1024)
+        self.submodules.sdrphy = GENSDRPHY(platform.request("sdram"), cl=2)
+        sdram_module = getattr(litedram_modules, sdram_module_cls)(clk_freq, "1:1")
+        self.register_sdram(self.sdrphy,
+                            sdram_module.geom_settings,
+                            sdram_module.timing_settings)
 
         # Let us reboot the device
 #        self.submodules.reboot = Reboot(platform.request("programn"))
@@ -203,18 +218,28 @@ class BaseSoC(SoCCore):
 # Build --------------------------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LiteX SoC on ULX3S")
+    parser = argparse.ArgumentParser(description="LiteX SoC on Hackaday Badge")
+    parser.add_argument("--gateware-toolchain", dest="toolchain", default="trellis",
+        help='gateware toolchain to use, diamond or trellis (default)')
     parser.add_argument("--device", dest="device", default="LFE5U-45F",
-        help='FPGA device, ULX3S can be populated with LFE5U-45F (default) or LFE5U-85F')
+        help='FPGA device, Hackaday badge is populated with LFE5U-45F')
     parser.add_argument("--sys-clk-freq", default=48e6,
                         help="system clock frequency (default=48MHz)")
+    parser.add_argument("--sdram-module", default="MT48LC16M16",
+                        help="SDRAM module: MT48LC16M16, AS4C32M16 or AS4C16M16 (default=MT48LC16M16)")
     builder_args(parser)
+    soc_sdram_args(parser)
     soc_core_args(parser)
     args = parser.parse_args()
 
-    soc = BaseSoC(device=args.device,
+#    soc = BaseSoC(device=args.device,
+#        sys_clk_freq=int(float(args.sys_clk_freq)),
+#        **soc_core_argdict(args))
+    soc = BaseSoC(device=args.device, toolchain=args.toolchain,
         sys_clk_freq=int(float(args.sys_clk_freq)),
-        **soc_core_argdict(args))
+        sdram_module_cls=args.sdram_module,
+        **soc_sdram_argdict(args))
+
     builder = Builder(soc, **builder_argdict(args))
     builder.build()
 
